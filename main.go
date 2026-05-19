@@ -89,11 +89,14 @@ func (a *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 	if resp.Status == 500 || resp.Status == 400 {
 		return
 	}
-	helperPostChirp(w, &resp)
+	helperPostChirp(w, &resp, a)
 	if resp.Status == 500 {
 		log.Printf("Something went wrong.")
 		return
 	}
+	chirp := Chirp{}
+	json.Unmarshal(*resp.Data, &chirp)
+
 }
 
 func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +106,7 @@ func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	err := json.Unmarshal(*resp.Data, &userInfo)
 	newUser, err := a.database.CreateUser(context.Background(), userInfo.Email)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error creating user: %s", err)
 	}
 	responseUser := User{ID: newUser.ID, CreatedAt: newUser.CreatedAt,
 		UpdatedAt: newUser.UpdatedAt, Email: newUser.Email}
@@ -190,7 +193,7 @@ func decoder(r *http.Request, Type string) RespJson {
 
 	case "CreateUser":
 		if err != nil {
-			log.Printf("Error: %s\n", err)
+			log.Printf("Error decoding data for user: %s\n", err)
 			resp.Status = 500
 			return resp
 		}
@@ -198,11 +201,10 @@ func decoder(r *http.Request, Type string) RespJson {
 		return resp
 
 	case "PostChirp":
-		err = decoder.Decode(&resp.Data)
 		chirpText := ChirpBody{}
 		json.Unmarshal(*resp.Data, &chirpText)
 		if err != nil {
-			log.Printf("Error: %s\n", err)
+			log.Printf("Error decoding data for chirp: %s\n", err)
 			resp.Status = 500
 			return resp
 		}
@@ -212,6 +214,7 @@ func decoder(r *http.Request, Type string) RespJson {
 			resp.Status = 400
 			return resp
 		}
+		resp.Status = 200
 		return resp
 	}
 
@@ -236,7 +239,7 @@ func searchProfanity(text string) string {
 	return words
 }
 
-func helperPostChirp(w http.ResponseWriter, data *RespJson) {
+func helperPostChirp(w http.ResponseWriter, data *RespJson, a *apiConfig) {
 
 	if data.Status == 400 {
 		respBody := returnError{Error: "Chirp is too long"}
@@ -268,6 +271,9 @@ func helperPostChirp(w http.ResponseWriter, data *RespJson) {
 		chirp := Chirp{}
 		json.Unmarshal(*data.Data, &chirp)
 		chirp.Body = cleanedResponse
+		params := database.CreateChirpyParams{Body: chirp.Body, UserID: chirp.UserID}
+		chirp2, err := a.database.CreateChirpy(context.Background(), params)
+		combineChirps(&chirp, &chirp2)
 		dat, err := json.Marshal(&chirp)
 		if err != nil {
 			log.Printf("Error marshalling JSON: %s", err)
@@ -276,10 +282,19 @@ func helperPostChirp(w http.ResponseWriter, data *RespJson) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
+		w.WriteHeader(201)
 		w.Write(dat)
-		data.Status = 200
+		data.Status = 201
 		return
 	}
+
+	log.Printf("Warning: End of PostChirp reached.")
 	data.Status = 500
+}
+
+func combineChirps(finalChirp *Chirp, dtbChirp *database.Chirp) {
+	finalChirp.CreatedAt = dtbChirp.CreatedAt
+	finalChirp.UpdatedAt = dtbChirp.UpdatedAt
+	finalChirp.UserID = dtbChirp.UserID
+	finalChirp.ID = dtbChirp.ID
 }
