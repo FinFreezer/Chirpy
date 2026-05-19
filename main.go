@@ -1,26 +1,62 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"sync/atomic"
-	"encoding/json"
-	"strings"
-	_ "github.com/lib/pq"
-	"database/sql"
 	"os"
+	"strings"
+	"sync/atomic"
 	"time"
-	"github.com/joho/godotenv"
+
 	"github.com/finfreezer/Chirpy/internal/database"
 	"github.com/google/uuid"
-	"context"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
+
+type RespType string
+
+type RespJson struct {
+	Type   RespType
+	Data   *json.RawMessage
+	Status int
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
-	database *database.Queries
-	platform string
+	database       *database.Queries
+	platform       string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type ChirpBody struct {
+	Body string `json:"body"`
+}
+
+type UserParameters struct {
+	Email string `json:"email"`
+}
+
+type returnError struct {
+	Error string `json:"error"`
 }
 
 func main() {
@@ -38,8 +74,9 @@ func main() {
 	newMux.HandleFunc("GET /api/healthz", handlerReadiness)
 	newMux.HandleFunc("GET /admin/metrics", a.handlerWriteMetrics)
 	newMux.HandleFunc("POST /admin/reset", a.handlerResetMetrics)
-	newMux.HandleFunc("POST /api/validate_chirp", a.handlerValidateChirp)
+	//newMux.HandleFunc("POST /api/validate_chirp", a.handlerValidateChirp)
 	newMux.HandleFunc("POST /api/users", a.handlerCreateUser)
+	newMux.HandleFunc("POST /api/chirps", a.handlerChirp)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
@@ -47,35 +84,43 @@ func main() {
 	}
 }
 
-func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
-	type User struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
+func (a *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
+	resp := decoder(r, "PostChirp")
+	if resp.Status == 500 || resp.Status == 400 {
+		return
 	}
+	helperPostChirp(w, &resp)
+	if resp.Status == 500 {
+		log.Printf("Something went wrong.")
+		return
+	}
+}
 
-	header, email := decoder(w, r)
-	newUser, err := a.database.CreateUser(context.Background(), email)
+func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
+
+	resp := decoder(r, "CreateUser")
+	userInfo := UserParameters{}
+	err := json.Unmarshal(*resp.Data, &userInfo)
+	newUser, err := a.database.CreateUser(context.Background(), userInfo.Email)
 	if err != nil {
 		log.Fatal(err)
 	}
-	responseUser := User{ID: newUser.ID, CreatedAt: newUser.CreatedAt, UpdatedAt: newUser.UpdatedAt, Email: email}
-	if header == 500 {
+	responseUser := User{ID: newUser.ID, CreatedAt: newUser.CreatedAt,
+		UpdatedAt: newUser.UpdatedAt, Email: newUser.Email}
+	if resp.Status == 500 {
 		log.Printf("Something went wrong decoding the email.")
 		return
 	}
 
 	dat, err := json.Marshal(responseUser)
 	if err != nil {
-			log.Printf("Error marshalling JSON: %s", err)
-			w.WriteHeader(500)
-			return
+		log.Printf("Error marshalling JSON: %s", err)
+		w.WriteHeader(500)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	w.Write(dat)
-	return
 }
 
 func handlerReadiness(w http.ResponseWriter, r *http.Request) {
@@ -84,19 +129,19 @@ func handlerReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(http.StatusText(http.StatusOK)))
 }
 
-func (a *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
-	header, textBody := decoder(w, r)
-	if (header == 500) {
-		return
+/*
+	func (a *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
+		header, textBody := decoder(w, r)
+		if header == 500 {
+			return
+		}
+		header = encoder(w, r, header, textBody)
+		if header == 500 {
+			log.Printf("Something went wrong.")
+			return
+		}
 	}
-	header = encoder(w, r, header, textBody)
-	if (header == 500) {
-		log.Printf("Something went wrong.")
-		return
-	}
-	return
-}
-
+*/
 func (a *apiConfig) handlerWriteMetrics(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	template := `
@@ -114,9 +159,9 @@ func (a *apiConfig) handlerWriteMetrics(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *apiConfig) handlerResetMetrics(w http.ResponseWriter, r *http.Request) {
-	if (a.platform != "dev") {
+	if a.platform != "dev" {
 		w.WriteHeader(403)
-		forbiddenString := fmt.Sprintf("403 Access forbidden. For admin use only.\n")
+		forbiddenString := fmt.Sprintln("403 Access forbidden. For admin use only.")
 		w.Write([]byte(forbiddenString))
 		return
 	}
@@ -133,95 +178,108 @@ func (a *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-func decoder(w http.ResponseWriter, r *http.Request) (int, string) {
-    type parameters struct {
-        Body string `json:"body"`
-		Email string `json:"email"`
-    }
-	returnString := ""
-    decoder := json.NewDecoder(r.Body)
-    params := parameters{}
-    err := decoder.Decode(&params)
-	fmt.Printf("Message body: %s\n", params.Body)
-	fmt.Printf("Email body: %s\n", params.Email)
+// Possible requests: PostChirp, CreateUser
+func decoder(r *http.Request, Type string) RespJson {
 
-	if (params.Body == "") {
-		returnString = params.Email
-	} else {
-		returnString = params.Body
+	resp := RespJson{}
+	var err error = nil
+	decoder := json.NewDecoder(r.Body)
+	err = decoder.Decode(&resp.Data)
+
+	switch Type {
+
+	case "CreateUser":
+		if err != nil {
+			log.Printf("Error: %s\n", err)
+			resp.Status = 500
+			return resp
+		}
+		resp.Status = 200
+		return resp
+
+	case "PostChirp":
+		err = decoder.Decode(&resp.Data)
+		chirpText := ChirpBody{}
+		json.Unmarshal(*resp.Data, &chirpText)
+		if err != nil {
+			log.Printf("Error: %s\n", err)
+			resp.Status = 500
+			return resp
+		}
+
+		if len(chirpText.Body) > 140 {
+			log.Printf("Body too large.")
+			resp.Status = 400
+			return resp
+		}
+		return resp
 	}
 
-	if ( len(params.Body) > 140 ) {
-		log.Printf("Body too large.")
-		return 400, returnString
-	}
-    if err != nil {
-		log.Printf("Error decoding parameters: %s", err)
-		return 500, returnString
-    }
-	return 200, returnString
+	resp.Status = 500
+	return resp
 }
 
-func searchProfanity(text string) (string){
+func searchProfanity(text string) string {
 	badWords := []string{"kerfuffle", "sharbert", "fornax"}
 	newText := strings.Split(text, " ")
 
-	for i, originalWord := range(newText) {
-		for _, badWord := range(badWords) {
-			if (strings.ToLower(originalWord) == badWord) {
+	for i, originalWord := range newText {
+		for _, badWord := range badWords {
+			if strings.ToLower(originalWord) == badWord {
 				newText[i] = "****"
 			}
 		}
 	}
-	
+
 	words := strings.Join(newText, " ")
 
 	return words
 }
 
-func encoder(w http.ResponseWriter, r *http.Request, header int, response string) (int){
-    type returnValid struct {
-        Valid bool `json:"valid"`
-    }
-	type returnError struct {
-        Error string `json:"error"`
-    }
-	type returnCleanText struct {
-		CleanedBody string `json:"cleaned_body"`
-	}
+func helperPostChirp(w http.ResponseWriter, data *RespJson) {
 
-
-	if (header == 400) {
-		respBody := returnError{Error:"Chirp is too long"}
+	if data.Status == 400 {
+		respBody := returnError{Error: "Chirp is too long"}
 		dat, err := json.Marshal(respBody)
 		if err != nil {
-				log.Printf("Error marshalling JSON: %s", err)
-				w.WriteHeader(500)
-				return 500
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			data.Status = 500
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-    	w.WriteHeader(400)
-    	w.Write(dat)
-		return 400
+		w.WriteHeader(400)
+		w.Write(dat)
+		data.Status = 400
+		return
 	}
-	if (header == 200) {
-		cleanedResponse := searchProfanity(response)
-		if header == (500) {
-			log.Printf("Error decoding JSON: %s")
-			return 500
-		}
-		respBody := returnCleanText{CleanedBody:cleanedResponse}
-		dat, err := json.Marshal(respBody)
+
+	if data.Status == 200 {
+		body := ChirpBody{}
+		err := json.Unmarshal(*data.Data, &body)
 		if err != nil {
-				log.Printf("Error marshalling JSON: %s", err)
-				w.WriteHeader(500)
-				return 500
+			log.Printf("Error unmarshalling JSON in helperPostChirp: %s", err)
+		}
+		cleanedResponse := searchProfanity(body.Body)
+		if data.Status == 500 {
+			log.Printf("Error decoding JSON")
+			return
+		}
+		chirp := Chirp{}
+		json.Unmarshal(*data.Data, &chirp)
+		chirp.Body = cleanedResponse
+		dat, err := json.Marshal(&chirp)
+		if err != nil {
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			data.Status = 500
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-    	w.WriteHeader(200)
-    	w.Write(dat)
-		return 200
+		w.WriteHeader(200)
+		w.Write(dat)
+		data.Status = 200
+		return
 	}
-    
-	return 500
+	data.Status = 500
 }
