@@ -95,7 +95,8 @@ func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(404)
 		return
 	}
-	dat, err := json.Marshal(chirp)
+	chirpReg := buildChirpHelper(chirp)
+	dat, err := json.Marshal(chirpReg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(dat)
