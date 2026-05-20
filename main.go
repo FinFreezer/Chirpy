@@ -77,11 +77,38 @@ func main() {
 	//newMux.HandleFunc("POST /api/validate_chirp", a.handlerValidateChirp)
 	newMux.HandleFunc("POST /api/users", a.handlerCreateUser)
 	newMux.HandleFunc("POST /api/chirps", a.handlerChirp)
+	newMux.HandleFunc("GET /api/chirps", a.handlerGetChirps)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (a *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
+	chirps, err := a.database.GetChirps(context.Background())
+	chirArr := []Chirp{}
+	if err != nil {
+		log.Printf("Error getting chirps: %s", err)
+	}
+	for _, chirp := range chirps {
+		chirArr = append(chirArr, buildChirpHelper(chirp))
+	}
+	dat, err := json.Marshal(chirArr)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(dat)
+}
+
+func buildChirpHelper(chirp database.Chirp) Chirp {
+	regChirp := Chirp{ID: chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+	return regChirp
+
 }
 
 func (a *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
