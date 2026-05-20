@@ -78,11 +78,27 @@ func main() {
 	newMux.HandleFunc("POST /api/users", a.handlerCreateUser)
 	newMux.HandleFunc("POST /api/chirps", a.handlerChirp)
 	newMux.HandleFunc("GET /api/chirps", a.handlerGetChirps)
+	newMux.HandleFunc("GET /api/chirps/{id}", a.handlerGetChirpByID)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	chirp, err := a.database.GetChirpByID(context.Background(), uuid.MustParse(id))
+
+	if err != nil {
+		log.Printf("Error finding Chirp based on ID: %s", err)
+		w.WriteHeader(404)
+		return
+	}
+	dat, err := json.Marshal(chirp)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(dat)
 }
 
 func (a *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
