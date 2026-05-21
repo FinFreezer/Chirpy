@@ -83,11 +83,47 @@ func main() {
 	newMux.HandleFunc("POST /api/chirps", a.handlerChirp)
 	newMux.HandleFunc("GET /api/chirps", a.handlerGetChirps)
 	newMux.HandleFunc("GET /api/chirps/{id}", a.handlerGetChirpByID)
+	newMux.HandleFunc("POST /api/login", a.handlerLogin)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	resp := decoder(r, "CreateUser")
+	userInfo := UserParameters{}
+	err := json.Unmarshal(*resp.Data, &userInfo)
+	user, err := a.database.GetUserByEmail(context.Background(), userInfo.Email)
+
+	if err != nil {
+		log.Printf("Error fetching user: %s", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte("Incorrect email or password"))
+		return
+	}
+
+	if ok, _ := auth.CheckPasswordHash(userInfo.Password, user.HashedPassword); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		responseUser := User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email}
+		dat, err := json.Marshal(&responseUser)
+		if err != nil {
+			log.Println("Problem marshaling user.")
+			w.WriteHeader(500)
+			return
+		}
+		w.Write(dat)
+		return
+	}
+
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte("Incorrect email or password"))
 }
 
 func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) {
