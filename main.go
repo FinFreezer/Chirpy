@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/finfreezer/Chirpy/internal/auth"
 	"github.com/finfreezer/Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -45,6 +46,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Password  string    `json:"password"`
 }
 
 type ChirpBody struct {
@@ -52,7 +54,8 @@ type ChirpBody struct {
 }
 
 type UserParameters struct {
-	Email string `json:"email"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 type returnError struct {
@@ -60,6 +63,7 @@ type returnError struct {
 }
 
 func main() {
+	auth.CreatePasswordHash("123")
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
@@ -148,12 +152,21 @@ func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	resp := decoder(r, "CreateUser")
 	userInfo := UserParameters{}
 	err := json.Unmarshal(*resp.Data, &userInfo)
-	newUser, err := a.database.CreateUser(context.Background(), userInfo.Email)
+	if userInfo.Password == "" {
+		w.WriteHeader(500)
+		w.Write([]byte("Password required."))
+		return
+	}
+	hashedPassword, err := auth.CreatePasswordHash(userInfo.Password)
+	userParams := database.CreateUserParams{Email: userInfo.Email, HashedPassword: hashedPassword}
+	newUser, err := a.database.CreateUser(context.Background(), userParams)
 	if err != nil {
 		log.Printf("Error creating user: %s", err)
 	}
-	responseUser := User{ID: newUser.ID, CreatedAt: newUser.CreatedAt,
-		UpdatedAt: newUser.UpdatedAt, Email: newUser.Email}
+	responseUser := User{ID: newUser.ID,
+		CreatedAt: newUser.CreatedAt,
+		UpdatedAt: newUser.UpdatedAt,
+		Email:     newUser.Email}
 	if resp.Status == 500 {
 		log.Printf("Something went wrong decoding the email.")
 		return
