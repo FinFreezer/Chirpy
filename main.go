@@ -47,7 +47,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
-	Token     string    `json:"token"`
+	Token     string    `json:"token,omitempty"`
 	Password  string    `json:"password,omitempty"`
 }
 
@@ -190,13 +190,13 @@ func (a *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 	if resp.Status == 500 || resp.Status == 400 {
 		return
 	}
-	helperPostChirp(w, &resp, a)
+	helperPostChirp(w, r, &resp, a)
 	if resp.Status == 500 {
 		log.Printf("Something went wrong.")
 		return
 	}
-	chirp := Chirp{}
-	json.Unmarshal(*resp.Data, &chirp)
+	/*chirp := Chirp{}
+	json.Unmarshal(*resp.Data, &chirp)*/
 
 }
 
@@ -349,7 +349,18 @@ func searchProfanity(text string) string {
 	return words
 }
 
-func helperPostChirp(w http.ResponseWriter, data *RespJson, a *apiConfig) {
+func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *apiConfig) {
+
+	authToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error receiving header data from request: %s", err)
+		return
+	}
+	userUUUID, err := auth.ValidateJWT(authToken, a.secret)
+	if err != nil {
+		log.Printf("Error validating JWT from request: %s", err)
+		return
+	}
 
 	if data.Status == 400 {
 		respBody := returnError{Error: "Chirp is too long"}
@@ -381,7 +392,7 @@ func helperPostChirp(w http.ResponseWriter, data *RespJson, a *apiConfig) {
 		chirp := Chirp{}
 		json.Unmarshal(*data.Data, &chirp)
 		chirp.Body = cleanedResponse
-		params := database.CreateChirpyParams{Body: chirp.Body, UserID: chirp.UserID}
+		params := database.CreateChirpyParams{Body: chirp.Body, UserID: userUUUID}
 		chirp2, err := a.database.CreateChirpy(context.Background(), params)
 		combineChirps(&chirp, &chirp2)
 		dat, err := json.Marshal(&chirp)

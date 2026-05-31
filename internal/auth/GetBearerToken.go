@@ -1,14 +1,16 @@
 package auth
 
 import (
-	"fmt"
 	"net/http"
+	"strings"
 )
 
 func GetBearerToken(headers http.Header) (string, error) {
 	headerValues := headers.Values("Authorization")
+	token := make(map[string]string)
 	for _, value := range headerValues {
-		fmt.Println(value)
+		tokens := strings.Split(value, " ")
+		token[tokens[0]] = tokens[1]
 	}
-	return "", nil
+	return token["Bearer"], nil
 }
