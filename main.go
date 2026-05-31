@@ -39,6 +39,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	database       *database.Queries
 	platform       string
+	secret         string
 }
 
 type User struct {
@@ -46,7 +47,8 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
-	Password  string    `json:"password"`
+	Token     string    `json:"token"`
+	Password  string    `json:"password,omitempty"`
 }
 
 type ChirpBody struct {
@@ -56,23 +58,28 @@ type ChirpBody struct {
 type UserParameters struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	Expiry   int64  `json:"expires_in_seconds"`
 }
 
 type returnError struct {
 	Error string `json:"error"`
 }
 
+// curl -X POST -H "Content-Type: application/json" -d '{"email":"protector@g.com","password":"securePassword"}' http://localhost:8080/api/users
+// curl -X POST -H "Content-Type: application/json" -d '{"email":"protector@g.com","password":"securePassword"}' http://localhost:8080/api/login
+// curl -X POST -H "Content-Type: application/json" -d '{"email":"protector@g.com","password":"securePassword","expires_in_seconds":60}' http://localhost:8080/api/login
 func main() {
 	auth.CreatePasswordHash("123")
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	dbQueries := database.New(db)
-	a := &apiConfig{atomic.Int32{}, dbQueries, platform}
+	a := &apiConfig{atomic.Int32{}, dbQueries, platform, secret}
 	newMux := http.NewServeMux()
 	newMux.Handle("/app/", a.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
 	newMux.HandleFunc("GET /api/healthz", handlerReadiness)
@@ -95,6 +102,9 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	resp := decoder(r, "CreateUser")
 	userInfo := UserParameters{}
 	err := json.Unmarshal(*resp.Data, &userInfo)
+	if userInfo.Expiry <= 0 || userInfo.Expiry > 3600 { //Set token expiry to 60 minutes
+		userInfo.Expiry = 3600
+	}
 	user, err := a.database.GetUserByEmail(context.Background(), userInfo.Email)
 
 	if err != nil {
@@ -105,13 +115,20 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ok, _ := auth.CheckPasswordHash(userInfo.Password, user.HashedPassword); ok {
+		authToken, err := auth.MakeJWT(user.ID, a.secret, time.Duration(userInfo.Expiry)*time.Second)
+		if err != nil {
+			log.Printf("Problem forming JWT: %s", err)
+			w.WriteHeader(500)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		responseUser := User{
 			ID:        user.ID,
 			CreatedAt: user.CreatedAt,
 			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email}
+			Email:     user.Email,
+			Token:     authToken}
 		dat, err := json.Marshal(&responseUser)
 		if err != nil {
 			log.Println("Problem marshaling user.")
