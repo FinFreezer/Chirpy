@@ -43,12 +43,13 @@ type apiConfig struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token,omitempty"`
-	Password  string    `json:"password,omitempty"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	Password     string    `json:"password,omitempty"`
 }
 
 type ChirpBody struct {
@@ -58,7 +59,6 @@ type ChirpBody struct {
 type UserParameters struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
-	Expiry   int64  `json:"expires_in_seconds"`
 }
 
 type returnError struct {
@@ -91,6 +91,8 @@ func main() {
 	newMux.HandleFunc("GET /api/chirps", a.handlerGetChirps)
 	newMux.HandleFunc("GET /api/chirps/{id}", a.handlerGetChirpByID)
 	newMux.HandleFunc("POST /api/login", a.handlerLogin)
+	newMux.HandleFunc("POST /api/refresh", a.handlerRefresh)
+	newMux.HandleFunc("POST /api/revoke", a.handlerRevoke)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
@@ -98,13 +100,85 @@ func main() {
 	}
 }
 
+func (a *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error finding refresh token: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	DbToken, err := a.database.GetRefreshToken(context.Background(), refreshToken)
+	if err != nil {
+		log.Printf("No token in database: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	newNulltime := sql.NullTime{Time: time.Now(), Valid: true}
+	params := database.UpdateRFTokenParams{RevokedAt: newNulltime, UpdatedAt: time.Now(), Token: DbToken.Token}
+	err = a.database.UpdateRFToken(context.Background(), params)
+	if err != nil {
+		log.Printf("Error updating refresh token database entry.")
+		w.WriteHeader(401)
+		return
+	}
+	w.WriteHeader(204)
+
+}
+
+func (a *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error finding refresh token: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	dbToken, err := a.database.GetRefreshToken(context.Background(), refreshToken)
+	if err != nil {
+		log.Printf("No token in database: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	user, err := a.database.GetUserByRFToken(context.Background(), dbToken.UserID)
+	if err != nil {
+		log.Printf("No user found for token ID: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	jwtToken, err := auth.MakeJWT(user.ID, a.secret, 60*time.Minute)
+	if err != nil {
+		log.Printf("Error creating JWT for current user: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+
+	if time.Now().After(dbToken.ExpiresAt) {
+		log.Printf("Token expired\n")
+		w.WriteHeader(401)
+		return
+	}
+	if dbToken.RevokedAt.Valid {
+		log.Printf("Token revoked.\n")
+		w.WriteHeader(401)
+		return
+	}
+	type tokenResp struct {
+		Token string `json:"token"`
+	}
+	resp := tokenResp{Token: jwtToken}
+	response, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Error marshaling refresh token: %s", err)
+		w.WriteHeader(401)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write(response)
+}
+
 func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	resp := decoder(r, "CreateUser")
 	userInfo := UserParameters{}
 	err := json.Unmarshal(*resp.Data, &userInfo)
-	if userInfo.Expiry <= 0 || userInfo.Expiry > 3600 { //Set token expiry to 60 minutes
-		userInfo.Expiry = 3600
-	}
 	user, err := a.database.GetUserByEmail(context.Background(), userInfo.Email)
 
 	if err != nil {
@@ -115,20 +189,28 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ok, _ := auth.CheckPasswordHash(userInfo.Password, user.HashedPassword); ok {
-		authToken, err := auth.MakeJWT(user.ID, a.secret, time.Duration(userInfo.Expiry)*time.Second)
+		authToken, err := auth.MakeJWT(user.ID, a.secret, time.Duration(3600*time.Second))
+
 		if err != nil {
 			log.Printf("Problem forming JWT: %s", err)
 			w.WriteHeader(500)
 			return
 		}
+		refreshToken := auth.MakeRefreshToken()
+		err = a.helperAddRefreshToken(refreshToken, user.ID)
+		if err != nil {
+			log.Printf("Error adding refresh token to database: %s", err)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		responseUser := User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
-			Token:     authToken}
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Email:        user.Email,
+			Token:        authToken,
+			RefreshToken: refreshToken}
 		dat, err := json.Marshal(&responseUser)
 		if err != nil {
 			log.Println("Problem marshaling user.")
@@ -141,6 +223,28 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusUnauthorized)
 	w.Write([]byte("Incorrect email or password"))
+}
+
+func (a *apiConfig) helperAddRefreshToken(token string, userID uuid.UUID) error {
+	revokeTime := sql.NullTime{Time: time.Time{}, Valid: false}
+	expiry, err := time.ParseDuration("1440h")
+	expireTime := time.Now().Add(expiry)
+	if err != nil {
+		log.Printf("Error creating Refresh Token expiration duration: %s", err)
+	}
+	newRefreshToken := database.CreateRefreshTokenParams{
+		Token:     token,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    userID,
+		ExpiresAt: expireTime,
+		RevokedAt: revokeTime}
+	_, err = a.database.CreateRefreshToken(context.Background(), newRefreshToken)
+	if err != nil {
+		log.Printf("Problem adding refresh token to Database: %s", err)
+		return err
+	}
+	return nil
 }
 
 func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) {
@@ -354,11 +458,13 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 	authToken, err := auth.GetBearerToken(r.Header)
 	if err != nil {
 		log.Printf("Error receiving header data from request: %s", err)
+		w.WriteHeader(401)
 		return
 	}
 	userUUUID, err := auth.ValidateJWT(authToken, a.secret)
 	if err != nil {
 		log.Printf("Error validating JWT from request: %s", err)
+		w.WriteHeader(401)
 		return
 	}
 
