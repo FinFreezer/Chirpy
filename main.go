@@ -40,6 +40,7 @@ type apiConfig struct {
 	database       *database.Queries
 	platform       string
 	secret         string
+	apiKey         string
 }
 
 type User struct {
@@ -82,12 +83,13 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET")
+	apiKey := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	dbQueries := database.New(db)
-	a := &apiConfig{atomic.Int32{}, dbQueries, platform, secret}
+	a := &apiConfig{atomic.Int32{}, dbQueries, platform, secret, apiKey}
 	newMux := http.NewServeMux()
 	newMux.Handle("/app/", a.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
 	newMux.HandleFunc("GET /api/healthz", handlerReadiness)
@@ -112,6 +114,12 @@ func main() {
 }
 
 func (a *apiConfig) handlerUpgradeEvent(w http.ResponseWriter, r *http.Request) {
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || apiKey != a.apiKey {
+		log.Printf("Error validating API key: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
 	resp := decoder(r, "UpgradeEvent")
 	if resp.Status == 204 || resp.Status == 500 {
 		log.Println("Error: invalid event.")
@@ -120,7 +128,7 @@ func (a *apiConfig) handlerUpgradeEvent(w http.ResponseWriter, r *http.Request) 
 	}
 
 	event := upgradeEvent{}
-	err := json.Unmarshal(*resp.Data, &event)
+	err = json.Unmarshal(*resp.Data, &event)
 	if err != nil {
 		log.Printf("Error unmarshaling event data: %s\n", err)
 		w.WriteHeader(500)
