@@ -47,6 +47,7 @@ type User struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Email        string    `json:"email"`
+	IsRed        bool      `json:"is_chirpy_red"`
 	Token        string    `json:"token,omitempty"`
 	RefreshToken string    `json:"refresh_token,omitempty"`
 	Password     string    `json:"password,omitempty"`
@@ -63,6 +64,13 @@ type UserParameters struct {
 
 type returnError struct {
 	Error string `json:"error"`
+}
+
+type upgradeEvent struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID string `json:"user_id"`
+	} `json:"data"`
 }
 
 // curl -X POST -H "Content-Type: application/json" -d '{"email":"protector@g.com","password":"securePassword"}' http://localhost:8080/api/users
@@ -93,11 +101,148 @@ func main() {
 	newMux.HandleFunc("POST /api/login", a.handlerLogin)
 	newMux.HandleFunc("POST /api/refresh", a.handlerRefresh)
 	newMux.HandleFunc("POST /api/revoke", a.handlerRevoke)
+	newMux.HandleFunc("PUT /api/users", a.handlerUpdateUser)
+	newMux.HandleFunc("DELETE /api/chirps/{chirpID}", a.handlerDeleteChirp)
+	newMux.HandleFunc("POST /api/polka/webhooks", a.handlerUpgradeEvent)
 	newServer := http.Server{Addr: ":8080", Handler: newMux}
 	err = newServer.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (a *apiConfig) handlerUpgradeEvent(w http.ResponseWriter, r *http.Request) {
+	resp := decoder(r, "UpgradeEvent")
+	if resp.Status == 204 || resp.Status == 500 {
+		log.Println("Error: invalid event.")
+		w.WriteHeader(resp.Status)
+		return
+	}
+
+	event := upgradeEvent{}
+	err := json.Unmarshal(*resp.Data, &event)
+	if err != nil {
+		log.Printf("Error unmarshaling event data: %s\n", err)
+		w.WriteHeader(500)
+		return
+	}
+	user, err := a.database.GetUserByRFToken(context.Background(),
+		uuid.MustParse(event.Data.UserID))
+	if err != nil {
+		log.Printf("Error finding user from database: %s\n", err)
+		w.WriteHeader(404)
+		return
+	}
+
+	_, err = a.database.UpgradeUserToRed(context.Background(), user.ID)
+
+	if err != nil {
+		log.Printf("Error upgrading user to Red: %s\n", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	w.WriteHeader(204)
+}
+
+func (a *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("chirpID")
+	chirp, err := a.database.GetChirpByID(context.Background(), uuid.MustParse(id))
+	if err != nil {
+		log.Printf("Error finding Chirp based on ID: %s\n", err)
+		w.WriteHeader(404)
+		return
+	}
+
+	accessToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error getting access token: %s\n", err)
+		w.WriteHeader(403)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(accessToken, a.secret)
+	if err != nil {
+		log.Printf("Error validating token: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+
+	if chirp.UserID != userID {
+		log.Printf("IDs don't match.\n")
+		w.WriteHeader(403)
+		return
+	}
+	params := database.DeleteChirpParams{ID: chirp.ID, UserID: userID}
+	err = a.database.DeleteChirp(r.Context(), params)
+	if err != nil {
+		log.Printf("Error deleting Chirp from database: %s\n", err)
+		w.WriteHeader(500)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (a *apiConfig) handlerUpdateUser(w http.ResponseWriter, r *http.Request) {
+	accessToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error getting access token: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	resp := decoder(r, "CreateUser")
+	if resp.Status != 200 {
+		log.Printf("Error decoding request body.\n")
+		w.WriteHeader(resp.Status)
+	}
+	userInfo := UserParameters{}
+	err = json.Unmarshal(*resp.Data, &userInfo)
+	if err != nil {
+		log.Printf("Error unmarshaling response in UpdateUser: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	userID, err := auth.ValidateJWT(accessToken, a.secret)
+	if err != nil {
+		log.Printf("Error validating JWT in UpdateUser: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	hashedPW, err := auth.CreatePasswordHash(userInfo.Password)
+	if err != nil {
+		log.Printf("Error hashing password in UpdateUser: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	params := database.UpdateUserParams{
+		HashedPassword: hashedPW,
+		Email:          userInfo.Email,
+		ID:             userID,
+	}
+	user, err := a.database.UpdateUser(context.Background(), params)
+	if err != nil {
+		log.Printf("Error updating user in database: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+
+	responseUser := User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+		IsRed:     user.IsChirpyRed,
+		Token:     accessToken}
+
+	dat, err := json.Marshal(&responseUser)
+	if err != nil {
+		log.Printf("Error marshaling user in UpdateUser: %s\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write(dat)
+
 }
 
 func (a *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +262,7 @@ func (a *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
 	params := database.UpdateRFTokenParams{RevokedAt: newNulltime, UpdatedAt: time.Now(), Token: DbToken.Token}
 	err = a.database.UpdateRFToken(context.Background(), params)
 	if err != nil {
-		log.Printf("Error updating refresh token database entry.")
+		log.Printf("Error updating refresh token database entry.\n")
 		w.WriteHeader(401)
 		return
 	}
@@ -167,7 +312,7 @@ func (a *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
 	resp := tokenResp{Token: jwtToken}
 	response, err := json.Marshal(resp)
 	if err != nil {
-		log.Printf("Error marshaling refresh token: %s", err)
+		log.Printf("Error marshaling refresh token: %s\n", err)
 		w.WriteHeader(401)
 		return
 	}
@@ -182,7 +327,7 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	user, err := a.database.GetUserByEmail(context.Background(), userInfo.Email)
 
 	if err != nil {
-		log.Printf("Error fetching user: %s", err)
+		log.Printf("Error fetching user: %s\n", err)
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte("Incorrect email or password"))
 		return
@@ -192,14 +337,14 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		authToken, err := auth.MakeJWT(user.ID, a.secret, time.Duration(3600*time.Second))
 
 		if err != nil {
-			log.Printf("Problem forming JWT: %s", err)
+			log.Printf("Problem forming JWT: %s\n", err)
 			w.WriteHeader(500)
 			return
 		}
 		refreshToken := auth.MakeRefreshToken()
 		err = a.helperAddRefreshToken(refreshToken, user.ID)
 		if err != nil {
-			log.Printf("Error adding refresh token to database: %s", err)
+			log.Printf("Error adding refresh token to database: %s\n", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -209,6 +354,7 @@ func (a *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:    user.CreatedAt,
 			UpdatedAt:    user.UpdatedAt,
 			Email:        user.Email,
+			IsRed:        user.IsChirpyRed,
 			Token:        authToken,
 			RefreshToken: refreshToken}
 		dat, err := json.Marshal(&responseUser)
@@ -230,7 +376,7 @@ func (a *apiConfig) helperAddRefreshToken(token string, userID uuid.UUID) error 
 	expiry, err := time.ParseDuration("1440h")
 	expireTime := time.Now().Add(expiry)
 	if err != nil {
-		log.Printf("Error creating Refresh Token expiration duration: %s", err)
+		log.Printf("Error creating Refresh Token expiration duration: %s\n", err)
 	}
 	newRefreshToken := database.CreateRefreshTokenParams{
 		Token:     token,
@@ -241,7 +387,7 @@ func (a *apiConfig) helperAddRefreshToken(token string, userID uuid.UUID) error 
 		RevokedAt: revokeTime}
 	_, err = a.database.CreateRefreshToken(context.Background(), newRefreshToken)
 	if err != nil {
-		log.Printf("Problem adding refresh token to Database: %s", err)
+		log.Printf("Problem adding refresh token to Database: %s\n", err)
 		return err
 	}
 	return nil
@@ -252,7 +398,7 @@ func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) 
 	chirp, err := a.database.GetChirpByID(context.Background(), uuid.MustParse(id))
 
 	if err != nil {
-		log.Printf("Error finding Chirp based on ID: %s", err)
+		log.Printf("Error finding Chirp based on ID: %s\n", err)
 		w.WriteHeader(404)
 		return
 	}
@@ -267,7 +413,7 @@ func (a *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 	chirps, err := a.database.GetChirps(context.Background())
 	chirArr := []Chirp{}
 	if err != nil {
-		log.Printf("Error getting chirps: %s", err)
+		log.Printf("Error getting chirps: %s\n", err)
 	}
 	for _, chirp := range chirps {
 		chirArr = append(chirArr, buildChirpHelper(chirp))
@@ -296,7 +442,7 @@ func (a *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 	}
 	helperPostChirp(w, r, &resp, a)
 	if resp.Status == 500 {
-		log.Printf("Something went wrong.")
+		log.Printf("Something went wrong.\n")
 		return
 	}
 	/*chirp := Chirp{}
@@ -318,20 +464,21 @@ func (a *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	userParams := database.CreateUserParams{Email: userInfo.Email, HashedPassword: hashedPassword}
 	newUser, err := a.database.CreateUser(context.Background(), userParams)
 	if err != nil {
-		log.Printf("Error creating user: %s", err)
+		log.Printf("Error creating user: %s\n", err)
 	}
 	responseUser := User{ID: newUser.ID,
 		CreatedAt: newUser.CreatedAt,
 		UpdatedAt: newUser.UpdatedAt,
-		Email:     newUser.Email}
+		Email:     newUser.Email,
+		IsRed:     newUser.IsChirpyRed}
 	if resp.Status == 500 {
-		log.Printf("Something went wrong decoding the email.")
+		log.Printf("Something went wrong decoding the email.\n")
 		return
 	}
 
 	dat, err := json.Marshal(responseUser)
 	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
+		log.Printf("Error marshalling JSON: %s\n", err)
 		w.WriteHeader(500)
 		return
 	}
@@ -395,7 +542,7 @@ func (a *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-// Possible requests: PostChirp, CreateUser
+// Possible requests: PostChirp, CreateUser, UpgradeEvent
 func decoder(r *http.Request, Type string) RespJson {
 
 	resp := RespJson{}
@@ -424,8 +571,23 @@ func decoder(r *http.Request, Type string) RespJson {
 		}
 
 		if len(chirpText.Body) > 140 {
-			log.Printf("Body too large.")
+			log.Printf("Body too large.\n")
 			resp.Status = 400
+			return resp
+		}
+		resp.Status = 200
+		return resp
+
+	case "UpgradeEvent":
+		event := upgradeEvent{}
+		json.Unmarshal(*resp.Data, &event)
+		if err != nil {
+			log.Printf("Error decoding webhook data: %s\n", err)
+			resp.Status = 500
+			return resp
+		}
+		if event.Event != "user.upgraded" {
+			resp.Status = 204
 			return resp
 		}
 		resp.Status = 200
@@ -457,13 +619,13 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 
 	authToken, err := auth.GetBearerToken(r.Header)
 	if err != nil {
-		log.Printf("Error receiving header data from request: %s", err)
+		log.Printf("Error receiving header data from request: %s\n", err)
 		w.WriteHeader(401)
 		return
 	}
 	userUUUID, err := auth.ValidateJWT(authToken, a.secret)
 	if err != nil {
-		log.Printf("Error validating JWT from request: %s", err)
+		log.Printf("Error validating JWT from request: %s\n", err)
 		w.WriteHeader(401)
 		return
 	}
@@ -472,7 +634,7 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 		respBody := returnError{Error: "Chirp is too long"}
 		dat, err := json.Marshal(respBody)
 		if err != nil {
-			log.Printf("Error marshalling JSON: %s", err)
+			log.Printf("Error marshalling JSON: %s\n", err)
 			w.WriteHeader(500)
 			data.Status = 500
 			return
@@ -488,11 +650,11 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 		body := ChirpBody{}
 		err := json.Unmarshal(*data.Data, &body)
 		if err != nil {
-			log.Printf("Error unmarshalling JSON in helperPostChirp: %s", err)
+			log.Printf("Error unmarshalling JSON in helperPostChirp: %s\n", err)
 		}
 		cleanedResponse := searchProfanity(body.Body)
 		if data.Status == 500 {
-			log.Printf("Error decoding JSON")
+			log.Printf("Error decoding JSON\n")
 			return
 		}
 		chirp := Chirp{}
@@ -503,7 +665,7 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 		combineChirps(&chirp, &chirp2)
 		dat, err := json.Marshal(&chirp)
 		if err != nil {
-			log.Printf("Error marshalling JSON: %s", err)
+			log.Printf("Error marshalling JSON: %s\n", err)
 			w.WriteHeader(500)
 			data.Status = 500
 			return
@@ -515,7 +677,7 @@ func helperPostChirp(w http.ResponseWriter, r *http.Request, data *RespJson, a *
 		return
 	}
 
-	log.Printf("Warning: End of PostChirp reached.")
+	log.Printf("Warning: End of PostChirp reached.\n")
 	data.Status = 500
 }
 

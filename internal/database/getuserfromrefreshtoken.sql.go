@@ -12,7 +12,7 @@ import (
 )
 
 const getUserByRFToken = `-- name: GetUserByRFToken :one
-SELECT id, created_at, updated_at, email, hashed_password FROM users
+SELECT id, created_at, updated_at, email, hashed_password, is_chirpy_red FROM users
 WHERE id = $1
 `
 
@@ -25,6 +25,7 @@ func (q *Queries) GetUserByRFToken(ctx context.Context, id uuid.UUID) (User, err
 		&i.UpdatedAt,
 		&i.Email,
 		&i.HashedPassword,
+		&i.IsChirpyRed,
 	)
 	return i, err
 }
