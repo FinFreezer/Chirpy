@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -418,11 +419,35 @@ func (a *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
-	chirps, err := a.database.GetChirps(context.Background())
-	chirArr := []Chirp{}
-	if err != nil {
-		log.Printf("Error getting chirps: %s\n", err)
+	author := r.URL.Query().Get("author_id")
+	sortQuery := r.URL.Query().Get("sort")
+	if author == "" {
+		chirps, err := a.database.GetChirps(context.Background())
+		chirArr := []Chirp{}
+		if err != nil {
+			log.Printf("Error getting chirps: %s\n", err)
+		}
+		for _, chirp := range chirps {
+			chirArr = append(chirArr, buildChirpHelper(chirp))
+		}
+		if sortQuery == "desc" {
+			sort.Slice(chirArr, func(i, j int) bool { return chirArr[i].CreatedAt.After(chirArr[j].CreatedAt) })
+		}
+		dat, err := json.Marshal(chirArr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(dat)
+		return
 	}
+
+	authorID := uuid.MustParse(author)
+	chirps, err := a.database.GetChirpsByAuthor(context.Background(), authorID)
+	if err != nil {
+		log.Printf("Error getting author's chirps from database: %s\n", err)
+		w.WriteHeader(500)
+		return
+	}
+	chirArr := []Chirp{}
 	for _, chirp := range chirps {
 		chirArr = append(chirArr, buildChirpHelper(chirp))
 	}
